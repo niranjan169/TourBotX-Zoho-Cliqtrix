@@ -1,0 +1,243 @@
+// ============================================================
+// FILE: main_bot_script.deluge
+// PURPOSE: Central controller for the Zoho SalesIQ Bot.
+//          Orchestrates the full conversation flow:
+//            1. Receives city from user
+//            2. Calls ai_location_detection to validate & detect state
+//            3. Handles Foreign / Unknown locations gracefully
+//            4. Calls package_search to fetch matching travel packages
+//            5. Returns a formatted package list to the user
+//            6. On Package ID input — calls booking_flow for the itinerary
+//
+// NOTE: In SalesIQ Bot Builder, function blocks (plugs) are
+//       deployed separately; this file shows the main orchestration logic
+//       that should be placed in your primary bot handler.
+// ============================================================
+
+// ------------------------------------------------------------
+// CONFIGURATION — Replace placeholders before deploying
+// ------------------------------------------------------------
+GEMINI_API_KEY   = "{{GEMINI_API_KEY}}";
+AIRTABLE_API_KEY = "{{AIRTABLE_API_KEY}}";
+AIRTABLE_BASE_ID = "{{AIRTABLE_BASE_ID}}";
+AIRTABLE_TABLE_ID= "{{AIRTABLE_TABLE_ID}}";
+Aiurl            = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY;
+
+// ------------------------------------------------------------
+// Initialize the response map that will be returned to the bot
+// ------------------------------------------------------------
+response = Map();
+
+// ------------------------------------------------------------
+// INPUT: City or location typed by the user in the chatbot
+// ------------------------------------------------------------
+cityName = session.get("city").get("value");
+
+// ============================================================
+// PHASE 1 — AI LOCATION DETECTION
+// Ask Gemini to identify if the entered location is a valid
+// Indian city, a foreign location, or an invalid input.
+// ============================================================
+
+prompt = "Analyze the following input: '" + cityName + "'. STRICT RULES:\n"
+       + "(1) If this is a valid city or place in India, return EXACTLY the State/UT name.\n"
+       + "(2) If this is a valid location outside India, return EXACTLY 'Foreign'.\n"
+       + "(3) If this is NOT a valid location anywhere, return EXACTLY 'Unknown'.\n"
+       + "Return ONLY the result: State/UT name, 'Foreign', or 'Unknown'. No extra text.";
+
+escaped = prompt.replaceAll("\"", "\\\"");
+
+// Build Gemini API request body
+body = Map();
+contents = List();
+content = Map();
+parts = List();
+part = Map();
+part.put("text", escaped);
+parts.add(part);
+content.put("parts", parts);
+contents.add(content);
+body.put("contents", contents);
+
+// Call Gemini AI for state detection
+stateName = "Unknown"; // default fallback
+
+try
+{
+    api_res = invokeurl
+    [
+        url     : Aiurl
+        type    : POST
+        body    : body.toString()
+        headers : {"Content-Type": "application/json"}
+    ];
+
+    stateName = api_res.get("candidates").get(0).get("content").get("parts").get(0).get("text");
+    stateName = stateName.replaceAll("", "")
+                         .replaceAll("\\*", "")
+                         .replaceAll("#", "")
+                         .trim();
+}
+catch (e)
+{
+    stateName = "Unknown";
+}
+
+// ============================================================
+// PHASE 2 — LOCATION VALIDATION & ROUTING
+// ============================================================
+
+// Case A: Foreign location — politely decline and offer alternatives
+if(stateName == "Foreign")
+{
+    response.put("packages", "🌏 It looks like *" + cityName + "* is outside India.\n\n"
+               + "We currently offer travel packages within India only. "
+               + "Please try an Indian city like Mumbai, Jaipur, or Coorg!");
+    return response;
+}
+
+// Case B: Unknown / invalid input — prompt the user to correct it
+if(stateName == "Unknown")
+{
+    response.put("packages", "We couldn't find any packages for the entered location.\n\n"
+               + "Please try a different Indian city or location.");
+    return response;
+}
+
+// ============================================================
+// PHASE 3 — AIRTABLE PACKAGE SEARCH
+// Fetch travel packages from Airtable filtered by the detected state.
+// ============================================================
+
+formula        = "State=\"" + stateName + "\"";
+encodedFormula = encodeUrl(formula);
+airtableUrl    = "https://api.airtable.com/v0/" + AIRTABLE_BASE_ID + "/" + AIRTABLE_TABLE_ID
+               + "?filterByFormula=" + encodedFormula;
+
+headers = Map();
+headers.put("Authorization", "Bearer " + AIRTABLE_API_KEY);
+
+apiResponse = invokeurl
+[
+    url     : airtableUrl
+    type    : GET
+    headers : headers
+];
+
+// No packages found for this state
+if(apiResponse.get("records").size() == 0)
+{
+    response.put("packages", "No packages available for *" + stateName + "* at the moment.\n\nTry another location!");
+    return response;
+}
+
+// ============================================================
+// PHASE 4 — NEAREST CITY AI MATCHING
+// Collect all cities from state records and ask Gemini to
+// identify the city that best matches or is nearest to the user query.
+// ============================================================
+
+records   = apiResponse.get("records");
+allCities = "";
+
+for each rec in records
+{
+    fields    = rec.get("fields");
+    allCities = allCities + fields.get("Cities Covered") + ",";
+}
+
+prompt2 = "From this list of Indian cities: " + allCities
+        + " return the BEST MATCH city for: " + cityName
+        + ". RULES: (1) If the exact same city exists, return EXACTLY that name. "
+        + "(2) Otherwise, return the geographically closest city. Return ONLY the city name.";
+
+escaped2 = prompt2.replaceAll("\"", "\\\"");
+
+body2 = Map();
+contents2 = List();
+content2 = Map();
+parts2 = List();
+part2 = Map();
+part2.put("text", escaped2);
+parts2.add(part2);
+content2.put("parts", parts2);
+contents2.add(content2);
+body2.put("contents", contents2);
+
+nearestCity = "Unknown";
+
+try
+{
+    api_res2 = invokeurl
+    [
+        url     : Aiurl
+        type    : POST
+        body    : body2.toString()
+        headers : {"Content-Type": "application/json"}
+    ];
+
+    nearestCity = api_res2.get("candidates").get(0).get("content").get("parts").get(0).get("text").trim();
+}
+catch (e)
+{
+    nearestCity = "Unknown";
+}
+
+// ============================================================
+// PHASE 5 — CITY-SPECIFIC PACKAGE FILTER
+// Refine results further by searching packages for the nearest city.
+// Falls back to state-level results if fewer than 2 city matches.
+// ============================================================
+
+cityFormula        = "FIND(\"" + nearestCity + "\", {Cities Covered})";
+encodedCityFormula = encodeUrl(cityFormula);
+cityUrl            = "https://api.airtable.com/v0/" + AIRTABLE_BASE_ID + "/" + AIRTABLE_TABLE_ID
+                   + "?filterByFormula=" + encodedCityFormula;
+
+apiCityResp = invokeurl
+[
+    url     : cityUrl
+    type    : GET
+    headers : headers
+];
+
+matchedPackages = apiCityResp.get("records");
+
+// Fallback: if city-specific results are sparse, use state-level records
+if(matchedPackages.size() < 2)
+{
+    matchedPackages = records;
+}
+
+// ============================================================
+// PHASE 6 — FORMAT & RETURN PACKAGE LIST
+// Build a readable, bot-friendly package listing string.
+// Displayed to user with a prompt to enter Package ID.
+// ============================================================
+
+packageString = "Here are the available packages for your location:\n\n";
+count         = 0;
+
+for each rec in matchedPackages
+{
+    if(count < 2)
+    {
+        fields = rec.get("fields");
+
+        packageString = packageString + "*" + fields.get("Package Name") + "*\n\n";
+        packageString = packageString + "*Package ID:* "              + fields.get("Id")                     + "\n";
+        packageString = packageString + "*Cities Covered:* "          + fields.get("Cities Covered")         + "\n";
+        packageString = packageString + "*Package Type:* "            + fields.get("Package Type")           + "\n";
+        packageString = packageString + "*Number of Days:* "          + fields.get("Number of Days")         + "\n";
+        packageString = packageString + "*Price per Person (INR):* ₹" + fields.get("Price per Person (INR)") + "\n\n\n";
+
+        count = count + 1;
+    }
+}
+
+packageString = packageString + "Please enter the *Package ID* to view the full itinerary.";
+
+response.put("packages",    packageString);
+response.put("nearestCity", nearestCity);
+
+return response;

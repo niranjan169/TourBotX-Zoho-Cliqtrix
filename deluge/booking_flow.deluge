@@ -1,0 +1,89 @@
+// ============================================================
+// FILE: booking_flow.deluge
+// PURPOSE: Manages the full user interaction flow:
+//          - Accepts a Package ID from the user
+//          - Queries Airtable for that specific package
+//          - Returns a detailed itinerary with pricing and inclusions
+// USED IN: SalesIQ Bot Builder — handles the second stage of the bot
+// ============================================================
+
+// ------------------------------------------------------------
+// CONFIGURATION — Replace placeholders before deploying
+// ------------------------------------------------------------
+AIRTABLE_API_KEY = "{{AIRTABLE_API_KEY}}";
+baseId           = "{{AIRTABLE_BASE_ID}}";
+tableId          = "{{AIRTABLE_TABLE_ID}}";
+
+// ------------------------------------------------------------
+// INPUT: Package ID entered by the user after viewing package list
+// ------------------------------------------------------------
+response   = Map();
+packageId  = session.get("packageId").get("value");
+
+// Validate that the user actually entered something
+if(packageId == null || packageId.trim() == "")
+{
+    response.put("itinerary", "Please enter a valid Package ID to view the itinerary.");
+    return response;
+}
+
+packageId = packageId.trim();
+
+// ------------------------------------------------------------
+// STEP 1 — Query Airtable for the specific package by ID
+// ------------------------------------------------------------
+idFormula        = "Id=\"" + packageId + "\"";
+encodedIdFormula = encodeUrl(idFormula);
+url              = "https://api.airtable.com/v0/" + baseId + "/" + tableId + "?filterByFormula=" + encodedIdFormula;
+
+headers = Map();
+headers.put("Authorization", "Bearer " + AIRTABLE_API_KEY);
+
+apiResponse = invokeurl
+[
+    url     : url
+    type    : GET
+    headers : headers
+];
+
+// ------------------------------------------------------------
+// STEP 2 — Check if a matching package was found
+// ------------------------------------------------------------
+if(apiResponse.get("records").size() == 0)
+{
+    response.put("itinerary", "No package found for Package ID: *" + packageId + "*.\n\nPlease check the ID and try again.");
+    return response;
+}
+
+// ------------------------------------------------------------
+// STEP 3 — Extract package fields and build the itinerary string
+// ------------------------------------------------------------
+fields = apiResponse.get("records").get(0).get("fields");
+
+itineraryString = "🌍 *" + fields.get("Package Name") + "*\n\n";
+itineraryString = itineraryString + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+itineraryString = itineraryString + "📍 *Cities Covered:* "          + fields.get("Cities Covered")          + "\n";
+itineraryString = itineraryString + "🗓️ *Number of Days:* "          + fields.get("Number of Days")           + " Days\n";
+itineraryString = itineraryString + "🏷️ *Package Type:* "            + fields.get("Package Type")             + "\n";
+itineraryString = itineraryString + "💰 *Price per Person (INR):* ₹" + fields.get("Price per Person (INR)")   + "\n\n";
+itineraryString = itineraryString + "📋 *Itinerary:*\n"             + fields.get("Itinerary")                 + "\n\n";
+
+// Optional field — only display if available in the Airtable record
+if(fields.get("Inclusions") != null)
+{
+    itineraryString = itineraryString + "✅ *Inclusions:*\n" + fields.get("Inclusions") + "\n\n";
+}
+
+if(fields.get("Exclusions") != null)
+{
+    itineraryString = itineraryString + "❌ *Exclusions:*\n" + fields.get("Exclusions") + "\n\n";
+}
+
+itineraryString = itineraryString + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+itineraryString = itineraryString + "Thank you for exploring with us! 🙏\nFeel free to search for another location anytime.";
+
+// ------------------------------------------------------------
+// RETURN: Itinerary string sent back to the bot as a message
+// ------------------------------------------------------------
+response.put("itinerary", itineraryString);
+return response;

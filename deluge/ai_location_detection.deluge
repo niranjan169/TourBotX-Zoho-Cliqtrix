@@ -1,0 +1,84 @@
+// ============================================================
+// FILE: ai_location_detection.deluge
+// PURPOSE: Sends user-entered city to Google Gemini AI and
+//          detects the corresponding Indian State or Union Territory.
+//          Also gracefully handles foreign locations and invalid inputs.
+// USED IN: SalesIQ Bot Builder — called from main_bot_script.deluge
+// ============================================================
+
+// ------------------------------------------------------------
+// CONFIGURATION — Replace placeholders before deploying
+// ------------------------------------------------------------
+GEMINI_API_KEY = "{{GEMINI_API_KEY}}";
+Aiurl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY;
+
+// ------------------------------------------------------------
+// INPUT: Read city/location entered by the user via the bot session
+// ------------------------------------------------------------
+cityName = session.get("city").get("value");
+
+// ------------------------------------------------------------
+// STEP 1 — Build the Gemini AI prompt
+// Instructs the model to:
+//   - Return the Indian State/UT if the location is in India
+//   - Return 'Foreign' if the location is valid but outside India
+//   - Return 'Unknown' if the location is invalid or unrecognizable
+// ------------------------------------------------------------
+prompt = "Analyze the following input: '" + cityName + "'. STRICT RULES:\n"
+       + "(1) If this is a valid city or place in India, return EXACTLY the State/UT name.\n"
+       + "(2) If this is a valid location outside India, return EXACTLY 'Foreign'.\n"
+       + "(3) If this is NOT a valid location anywhere, return EXACTLY 'Unknown'.\n"
+       + "Return ONLY the result: State/UT name, 'Foreign', or 'Unknown'. No extra text, no explanation.";
+
+// Escape any double-quote characters for safe JSON embedding
+escaped = prompt.replaceAll("\"", "\\\"");
+
+// ------------------------------------------------------------
+// STEP 2 — Construct the Gemini API request body
+// ------------------------------------------------------------
+body = Map();
+contents = List();
+content = Map();
+parts = List();
+part = Map();
+part.put("text", escaped);
+parts.add(part);
+content.put("parts", parts);
+contents.add(content);
+body.put("contents", contents);
+
+// ------------------------------------------------------------
+// STEP 3 — Call the Gemini AI API
+// ------------------------------------------------------------
+stateName = "Unknown"; // default on failure
+
+try
+{
+    api_res = invokeurl
+    [
+        url     : Aiurl
+        type    : POST
+        body    : body.toString()
+        headers : {"Content-Type": "application/json"}
+    ];
+
+    // Extract the plain-text response from the AI
+    stateName = api_res.get("candidates").get(0).get("content").get("parts").get(0).get("text");
+
+    // Strip any stray markdown symbols the model may include
+    stateName = stateName.replaceAll("", "")
+                         .replaceAll("\\*", "")
+                         .replaceAll("#", "")
+                         .trim();
+}
+catch (e)
+{
+    // On API failure, default to Unknown so the bot can respond gracefully
+    stateName = "Unknown";
+}
+
+// ------------------------------------------------------------
+// RETURN: stateName is passed back to main_bot_script.deluge
+// Possible values: <Indian State/UT name> | "Foreign" | "Unknown"
+// ------------------------------------------------------------
+return stateName;

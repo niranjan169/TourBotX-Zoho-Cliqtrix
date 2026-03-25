@@ -1,0 +1,166 @@
+// ============================================================
+// FILE: package_search.deluge
+// PURPOSE: Queries the Airtable database to:
+//          1. Fetch all travel packages for a given Indian state
+//          2. Use Gemini AI to identify the nearest city from the list
+//          3. Filter and return packages for that nearest city
+// USED IN: SalesIQ Bot Builder — called from main_bot_script.deluge
+// ============================================================
+
+// ------------------------------------------------------------
+// CONFIGURATION — Replace placeholders before deploying
+// ------------------------------------------------------------
+AIRTABLE_API_KEY = "{{AIRTABLE_API_KEY}}";
+baseId           = "{{AIRTABLE_BASE_ID}}";
+tableId          = "{{AIRTABLE_TABLE_ID}}";
+GEMINI_API_KEY   = "{{GEMINI_API_KEY}}";
+Aiurl            = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY;
+
+// ------------------------------------------------------------
+// INPUT PARAMETERS (passed from main_bot_script.deluge)
+// stateName : Indian State/UT name detected by ai_location_detection
+// cityName  : Original city name entered by the user
+// ------------------------------------------------------------
+// stateName = <passed in>
+// cityName  = <passed in>
+
+// Initialize response map
+response = Map();
+
+// ------------------------------------------------------------
+// STEP 1 — Build Airtable URL filtered by detected state
+// ------------------------------------------------------------
+formula        = "State=\"" + stateName + "\"";
+encodedFormula = encodeUrl(formula);
+url            = "https://api.airtable.com/v0/" + baseId + "/" + tableId + "?filterByFormula=" + encodedFormula;
+
+// Airtable request headers
+headers = Map();
+headers.put("Authorization", "Bearer " + AIRTABLE_API_KEY);
+
+// ------------------------------------------------------------
+// STEP 2 — Call Airtable API to get all packages for the state
+// ------------------------------------------------------------
+apiResponse = invokeurl
+[
+    url     : url
+    type    : GET
+    headers : headers
+];
+
+// Early exit if no records found for this state
+if(apiResponse.get("records").size() == 0)
+{
+    response.put("packages", "No packages are available for the entered location.\n\nPlease try a different one.");
+    return response;
+}
+
+records = apiResponse.get("records");
+
+// ------------------------------------------------------------
+// STEP 3 — Collect all cities from the returned records
+//           to send to Gemini for nearest-city matching
+// ------------------------------------------------------------
+allCities = "";
+for each rec in records
+{
+    fields    = rec.get("fields");
+    allCities = allCities + fields.get("Cities Covered") + ",";
+}
+
+// ------------------------------------------------------------
+// STEP 4 — Ask Gemini AI to find the best matching / nearest city
+// ------------------------------------------------------------
+prompt2 = "From this list of Indian cities: " + allCities
+        + " return the BEST MATCH city for: " + cityName
+        + ". RULES: (1) If the exact same city exists, return EXACTLY that name. "
+        + "(2) Otherwise, return the geographically closest city. Return ONLY the city name.";
+
+escaped2 = prompt2.replaceAll("\"", "\\\"");
+
+body2 = Map();
+contents2 = List();
+content2 = Map();
+parts2 = List();
+part2 = Map();
+part2.put("text", escaped2);
+parts2.add(part2);
+content2.put("parts", parts2);
+contents2.add(content2);
+body2.put("contents", contents2);
+
+nearestCity = "Unknown";
+
+try
+{
+    api_res2 = invokeurl
+    [
+        url     : Aiurl
+        type    : POST
+        body    : body2.toString()
+        headers : {"Content-Type": "application/json"}
+    ];
+
+    nearestCity = api_res2.get("candidates").get(0).get("content").get("parts").get(0).get("text").trim();
+}
+catch (e)
+{
+    // If AI call fails, fall back to first city in the list as a best-effort match
+    nearestCity = "Unknown";
+}
+
+// ------------------------------------------------------------
+// STEP 5 — Query Airtable again filtered by the nearest city
+//           (uses Airtable FIND formula for partial match support)
+// ------------------------------------------------------------
+cityFormula        = "FIND(\"" + nearestCity + "\", {Cities Covered})";
+encodedCityFormula = encodeUrl(cityFormula);
+url2               = "https://api.airtable.com/v0/" + baseId + "/" + tableId + "?filterByFormula=" + encodedCityFormula;
+
+apiCityResp = invokeurl
+[
+    url     : url2
+    type    : GET
+    headers : headers
+];
+
+// ------------------------------------------------------------
+// STEP 6 — Fallback: if fewer than 2 city-specific packages found,
+//           use all state-level packages instead
+// ------------------------------------------------------------
+matchedPackages = apiCityResp.get("records");
+
+if(matchedPackages.size() < 2)
+{
+    matchedPackages = records; // fall back to full state results
+}
+
+// ------------------------------------------------------------
+// STEP 7 — Build the formatted package listing string (max 2 packages)
+// ------------------------------------------------------------
+packageString = "Here are the available packages for your location:\n\n";
+count         = 0;
+
+for each rec in matchedPackages
+{
+    if(count < 2)
+    {
+        fields = rec.get("fields");
+
+        packageString = packageString + "*" + fields.get("Package Name") + "*\n\n";
+        packageString = packageString + "*Package ID:* "              + fields.get("Id")                    + "\n";
+        packageString = packageString + "*Cities Covered:* "          + fields.get("Cities Covered")        + "\n";
+        packageString = packageString + "*Package Type:* "            + fields.get("Package Type")          + "\n";
+        packageString = packageString + "*Number of Days:* "          + fields.get("Number of Days")        + "\n";
+        packageString = packageString + "*Price per Person (INR):* "  + fields.get("Price per Person (INR)") + "\n\n\n";
+
+        count = count + 1;
+    }
+}
+
+packageString = packageString + "Please enter the Package ID to view the itinerary.";
+
+response.put("packages",    packageString);
+response.put("nearestCity", nearestCity);
+
+return response;
